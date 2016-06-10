@@ -35,11 +35,14 @@
 # 2) Add the flight to the database if it does not already exist.
 # 3) Update the last time the flight was seen.
 
-import datetime
+from datetime import datetime
+from datetime import timedelta 
 import inotify.adapters
 from  inotify.constants import IN_MOVED_TO
 import json
 import re
+import signal
+import sys
 import time
 import os
 #import urllib2
@@ -63,7 +66,8 @@ class FlightsProcessor(object):
         self.config = config
         self.dbType = config["database"]["type"]
         # List of required keys for position data entries
-        self.position_keys = ('lat', 'lon', 'altitude', 'speed', 'track', 'vert_rate')
+        self.position_keys = ('hex', 'lat', 'lon', 'altitude', 'speed', 'track', 'vert_rate')
+        self.pending_positions = dict()
 
     def setupDBStatements(self, formatSymbol):
         if hasattr(self, 'STMTS'):
@@ -84,6 +88,7 @@ class FlightsProcessor(object):
         }
 
     def connectDB(self):
+        #self.config["database"]["db"]="portal.sqlite"
         if self.dbType == "sqlite": ## Connect to a SQLite database.
             self.setupDBStatements("?")
             return sqlite3.connect(self.config["database"]["db"])
@@ -94,22 +99,41 @@ class FlightsProcessor(object):
                 passwd=self.config["database"]["passwd"],
                 db=self.config["database"]["db"])
 
-    def processAircraftList(self, aircraftList):
+    def addPendingAircraftList(self, aircraftList):
+        added = 0
+        for aircraft in aircraftList:
+            # Check if position data is available.
+            if (all (k in aircraft for k in self.position_keys) and aircraft["altitude"] != "ground"):
+                added += 1
+                icao_hex = aircraft["hex"]
+                if icao_hex not in self.pending_positions:
+                    self.pending_positions[icao_hex] = aircraft
+                else:
+                    # update existing values, retaining any that are missing
+                    self.pending_positions[icao_hex].update(aircraft)
+        log("Added " + str(added) + " of " + str(len(aircraftList)) + " messages to work queue")
+
+    def processPendingAircraftList(self):
         db = self.connectDB()
         # Get Database cursor handle
         self.cursor = db.cursor()
         # Assign the time to a variable.
-        self.time_now = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S")
+        self.time_now = datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S")
 
-        for aircraft in aircraftList:
-            self.processAircraft(aircraft) 
+        log("Processing " + str(len(self.pending_positions)) + " messages from work queue")
+
+        for (icao_hex, aircraft) in self.pending_positions.iteritems():
+            log("Icao " + icao_hex + " aircraft " + repr(aircraft))
+            self.processAircraft(icao_hex, aircraft)
+
+        # clear out the pending messages
+        self.pending_positions = dict()
 
         # Close the database connection.
         db.commit()
         db.close()
 
-    def processAircraft(self, aircraft):
-        hexcode = aircraft["hex"]
+    def processAircraft(self, hexcode, aircraft):
         # Check if this aircraft was already seen.
         self.cursor.execute(self.STMTS['select_aircraft_count'], (hexcode,))
         row_count = self.cursor.fetchone()
@@ -150,12 +174,9 @@ class FlightsProcessor(object):
         self.cursor.execute(self.STMTS['select_flight_id'], (flight,))
         row = self.cursor.fetchone()
         flight_id = row[0]
+        self.processPosition(flight_id, aircraft)
 
-        # Check if position data is available.
-        if (all (k in aircraft for k in self.position_keys) and aircraft["altitude"] != "ground"):
-            self.processPositions(flight_id, aircraft)
-
-    def processPositions(self, flight_id, aircraft):
+    def processPosition(self, flight_id, aircraft):
         # Check that this message has not already been added to the database.
         params = (flight_id, aircraft["messages"],)
         self.cursor.execute(self.STMTS['select_position'], params)
@@ -185,6 +206,21 @@ if __name__ == "__main__":
     i = inotify.adapters.Inotify()
     i.add_watch(mutability_dir, IN_MOVED_TO)
 
+    # Install graceful termination handler
+    def signal_handler(signal, frame):
+        print('Finishing processing...')
+        i.remove_watch(mutability_dir)
+        processor.processPendingAircraftList()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # the time between processing pending collected messages
+    time_delta = timedelta(seconds=60)
+
+    # the last time data was processed
+    last_process_time = datetime.now()
+
     # Main run loop
     for event in i.event_gen():
         if event is not None:
@@ -199,7 +235,9 @@ if __name__ == "__main__":
                 #response = urllib2.urlopen('http://192.168.254.2/dump1090/data/aircraft.json')
                 #data = json.load(response)
 
-                processor.processAircraftList(data["aircraft"])
-
-                log("Last Run: " + datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")) 
+                processor.addPendingAircraftList(data["aircraft"])
+                #log("Last Run: " + datetime.now().strftime("%Y/%m/%d %H:%M:%S")) 
+        elif (datetime.now() - last_process_time) >= time_delta:
+            last_process_time = datetime.now()
+            processor.processPendingAircraftList()
 
